@@ -1,9 +1,10 @@
-import {Tree, Tag, Parser} from "lezer"
+import {Tree, NodeType, NodeProp, Parser} from "lezer"
 
 const none: readonly any[] = []
 
 class TestSpec {
-  constructor(readonly tag: string,
+  constructor(readonly name: string,
+              readonly props: {prop: NodeProp<any>, value: any}[],
               readonly children: readonly TestSpec[] = none) {}
 
   static parse(spec: string): readonly TestSpec[] {
@@ -15,12 +16,18 @@ class TestSpec {
       while (pos < spec.length && /\s/.test(spec.charAt(pos))) pos++
       if (pos == spec.length) return tok = "eof"
       let next = spec.charAt(pos++)
-      if (/[(),]/.test(next)) return tok = next
-      if (/[^(),\s]/.test(next)) {
-        let tag = /^([^(),\s"]|"([^"]|\\.)*")+/.exec(spec.slice(pos - 1))
-        value = tag![0]
-        pos += tag![0].length - 1
-        return tok = "tag"
+      if (/[\[\](),=]/.test(next)) return tok = next
+      if (/[^()\[\],="\s]/.test(next)) {
+        let name = /[^()\[\],="\s]*/.exec(spec.slice(pos - 1))
+        value = name![0]
+        pos += name![0].length - 1
+        return tok = "name"
+      }
+      if (next == '"') {
+        let content = /^"((?:[^\\"]|\\.)*)"/.exec(spec.slice(pos - 1)) || err()
+        value = JSON.parse(content[0])
+        pos += content[0].length - 1
+        return tok = "name"
       }
       return err()
     }
@@ -34,9 +41,26 @@ class TestSpec {
       return seq
     }
     function parse() {
-      if (tok != "tag") err()
-      let tag = value, children = none
+      let name = value, children = none, props = []
+      if (tok != "name") err()
       next()
+      if (tok == "[") {
+        next()
+        while (tok as any != "]") {
+          if (tok as any != "name") err()
+          let prop = (NodeProp as any)[value] as NodeProp<any>, val = ""
+          if (!(prop instanceof NodeProp)) err()
+          next()
+          if (tok as any == "=") {
+            next()
+            if (tok as any != "name") err()
+            val = value
+            next()
+          }
+          props.push({prop, value: prop.deserialize(val)})
+        }
+        next()
+      }
       if (tok == "(") {
         next()
         children = parseSeq()
@@ -44,43 +68,51 @@ class TestSpec {
         if (tok != ")") err()
         next()
       }
-      return new TestSpec(tag, children)
+      return new TestSpec(name, props, children)
     }
     let result = parseSeq()
     if (tok != "eof") err()
     return result
   }
+
+  matches(type: NodeType) {
+    if (type.name != this.name) return false
+    for (let {prop, value} of this.props)
+      if (type.prop(prop) != value && (value || type.prop(prop))) return false
+    return true
+  }
 }
 
-function defaultIgnore(tag: Tag) {
-  return tag.has("punctuation")
+function defaultIgnore(type: NodeType) {
+  return /\W/.test(type.name)
 }
 
 export function testTree(tree: Tree, expect: string, mayIgnore = defaultIgnore) {
   let specs = TestSpec.parse(expect)
   let stack = [specs], pos = [0]
-  tree.iterate(0, tree.length, tag => {
+  tree.iterate(0, tree.length, (type, start) => {
     let last = stack.length - 1, index = pos[last], seq = stack[last]
     let next = index < seq.length ? seq[index] : null
-    if (next && (/\$$/.test(next.tag) ? tag.tag == next.tag.replace("$", "") : tag.tag.indexOf(next.tag) == 0)) {
+    if (next && next.matches(type)) {
       pos.push(0)
       stack.push(next.children)
       return undefined
-    } else if (mayIgnore(tag)) {
+    } else if (mayIgnore(type)) {
       return false
     } else {
-      let parent = last > 0 ? stack[last - 1][pos[last - 1]].tag : "tree"
-      let after = next ? next.tag + (parent == "tree" ? "" : " in " + parent) : `end of ${parent}`
-      throw new Error(`Expected ${after}, got ${tag.tag}`)
+      let parent = last > 0 ? stack[last - 1][pos[last - 1]].name : "tree"
+      let after = next ? next.name + (parent == "tree" ? "" : " in " + parent) : `end of ${parent}`
+      throw new Error(`Expected ${after}, got ${type.name} at ${start}`)
     }
-  }, (tag) => {
+  }, (type, start) => {
     let last = stack.length - 1, index = pos[last], seq = stack[last]
-    if (index < seq.length) throw new Error(`Unexpected end of ${tag.tag}. Expected ${seq.slice(index).map(s => s.tag)}.`)
+    if (index < seq.length) throw new Error(`Unexpected end of ${type.name}. Expected ${seq.slice(index).map(s => s.name).join(", ")} at ${start}`)
     pos.pop()
     stack.pop()
     pos[last - 1]++
   })
-  if (pos[0] != specs.length) throw new Error(`Unexpected end of tree. Expected ${stack[0].slice(pos[0]).map(s => s.tag)}.`)
+  if (pos[0] != specs.length)
+    throw new Error(`Unexpected end of tree. Expected ${stack[0].slice(pos[0]).map(s => s.name).join(", ")} at ${tree.length}`)
 }
 
 export function fileTests(file: string, fileName: string, mayIgnore = defaultIgnore) {
@@ -93,7 +125,7 @@ export function fileTests(file: string, fileName: string, mayIgnore = defaultIgn
     tests.push({
       name: m[1],
       run(parser: Parser) {
-        let strict = expected.indexOf("⚠") < 0
+        let strict = !/⚠/.test(expected)
         testTree(parser.parse(text, {strict}), expected, mayIgnore)
       }
     })

@@ -3,17 +3,17 @@ import {Term as T} from "lezer/src/constants"
 const enum TermFlag {
   // This term is a terminal
   Terminal = 1,
-  // This is the inner term generated for a repetition operator
-  Repeated = 2,
   // This is the top production
-  Top = 4,
-  // This is the error term
-  Error = 8,
+  Top = 2,
   // This represents end-of-file
-  Eof = 16,
+  Eof = 4,
   // This should be preserved, even if it doesn't occur in any rule
-  Preserve = 32
+  Preserve = 8
 }
+
+export type Props = {[name: string]: string}
+
+export const noProps: Props = Object.create(null)
 
 let termHash = 0
 
@@ -25,70 +25,87 @@ export class Term {
 
   constructor(readonly name: string,
               private flags: number,
-              readonly tag: string | null) {}
+              readonly nodeName: string | null,
+              readonly props: Props = noProps) {
+    nope: { // Make sure props == noProps when the object is empty
+      for (let _ in props) break nope
+      this.props = noProps
+    }
+  }
+
   toString() { return this.name }
+  get nodeType() { return this.nodeName != null || this.props != noProps || this.repeated }
   get terminal() { return (this.flags & TermFlag.Terminal) > 0 }
   get eof() { return (this.flags & TermFlag.Eof) > 0 }
-  get error() { return (this.flags & TermFlag.Error) > 0 }
+  get error() { return "error" in this.props }
   get top() { return (this.flags & TermFlag.Top) > 0 }
-  get interesting() { return this.flags > 0 || this.tag != null }
-  set repeated(value: boolean) { this.flags = value ? this.flags | TermFlag.Repeated : this.flags & ~TermFlag.Repeated }
-  get repeated() { return (this.flags & TermFlag.Repeated) > 0 }
+  get interesting() { return this.flags > 0 || this.nodeName != null }
+  get repeated() { return "repeated" in this.props }
   set preserve(value: boolean) { this.flags = value ? this.flags | TermFlag.Preserve : this.flags & ~TermFlag.Preserve }
   get preserve() { return (this.flags & TermFlag.Preserve) > 0 }
   cmp(other: Term) { return this.hash - other.hash }
 }
 
 export class TermSet {
-  nonTerminals: Term[] = []
-  terminals: Term[] = []
+  terms: Term[] = []
+  names: {[name: string]: Term} = Object.create(null)
   eof: Term
   error: Term
-  top: Term
+  top!: Term
 
   constructor() {
     this.eof = this.term("␄", null, TermFlag.Terminal | TermFlag.Eof)
-    this.error = this.term("⚠", "⚠", TermFlag.Error | TermFlag.Preserve)
-    this.top = this.term("@top", null, TermFlag.Top)
+    this.error = this.term("⚠", "⚠", TermFlag.Preserve, {error: ""})
   }
 
-  term(name: string, tag: string | null, flags: number = 0) {
-    let term = new Term(name, flags, tag)
-    ;(term.terminal ? this.terminals : this.nonTerminals).push(term)
+  term(name: string, nodeName: string | null, flags: number = 0, props: Props = noProps) {
+    let term = new Term(name, flags, nodeName, props)
+    this.terms.push(term)
+    this.names[name] = term
     return term
   }
 
-  makeTerminal(name: string, tag: string | null) {
-    return this.term(name, tag, TermFlag.Terminal)
+  makeTop(nodeName: string | null, props: Props) {
+    return this.top = this.term("@top", nodeName, TermFlag.Top, props)
   }
 
-  makeNonTerminal(name: string, tag: string | null) {
-    return this.term(name, tag, 0)
+  makeTerminal(name: string, nodeName: string | null, props = noProps) {
+    return this.term(name, nodeName, TermFlag.Terminal, props)
+  }
+
+  makeNonTerminal(name: string, nodeName: string | null, props = noProps) {
+    return this.term(name, nodeName, 0, props)
   }
 
   finish(rules: readonly Rule[]) {
     for (let rule of rules) rule.name.rules.push(rule)
 
-    let tags: string[] = []
+    this.terms = this.terms.filter(t => t.terminal || t.preserve || rules.some(r => r.name == t || r.parts.includes(t)))
+
     let names: {[id: number]: string} = {}
+    let nodeTypes = [this.error, this.top]
 
-    let taggedID = 1, untaggedID = 0
-    for (let term of this.nonTerminals)
-      if (term.id < 0 && (term.preserve || rules.some(r => r.name == term || r.parts.includes(term))))
-        term.id = term.error ? T.Err : term.tag ? (taggedID += 2) : (untaggedID += 2)
-    for (let term of this.terminals)
-      term.id = term.eof ? T.Eof : term.tag ? (taggedID += 2) : (untaggedID += 2)
-    if (taggedID >= 0xffff) throw new Error("Too many tagged terms")
-    if (untaggedID >= 0xffff) throw new Error("Too many untagged terms")
-
-    for (let term of this.terminals.concat(this.nonTerminals)) if (term.id > -1) {
-      if (term.tag) tags[term.id >> 1] = term.tag
+    this.error.id = T.Err
+    this.top.id = T.Top
+    let nextID = 2
+    // Assign ids to terms that represent node types, with the repeated terms at the end
+    for (let first = true;; first = false) {
+      for (let term of this.terms) {
+        if (term.id < 0 && term.nodeType && !(first && term.repeated)) {
+          term.id = nextID++
+          nodeTypes.push(term)
+        }
+      }
+      if (!first) break
+    }
+    this.eof.id = nextID++
+    for (let term of this.terms) {
+      if (term.id < 0) term.id = nextID++
       names[term.id] = term.name
     }
+    if (nextID >= 0xfffe) throw new Error("Too many terms")
 
-    this.nonTerminals = this.nonTerminals.filter(t => t.id > -1)
-
-    return {tags, names}
+    return {nodeTypes, names}
   }
 }
 

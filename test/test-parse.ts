@@ -30,18 +30,17 @@ describe("parsing", () => {
     @precedence { call }
 
     @top { statement* }
-    statement { conditional | loop | block | expression p<";"> }
-    conditional:cond { kw<"if"> expression statement }
-    block:block { p<"{"> statement* p<"}"> }
-    loop:loop { kw<"while"> expression statement }
-    expression { callExpression | number | variable | p<"!"> expression }
-    callExpression:call { expression !call p<"("> expression* p<")"> }
+    statement { Cond | Loop | Block | expression ";" }
+    Cond { kw<"if"> expression statement }
+    Block { "{" statement* "}" }
+    Loop { kw<"while"> expression statement }
+    expression { Call | Num | Var | "!" expression }
+    Call { expression !call "(" expression* ")" }
 
-    kw<value> { @specialize<variable, value> }
+    kw<value> { @specialize<Var, value> }
     @tokens {
-      p<x> { x }
-      number:num { std.digit+ }
-      variable:var { std.asciiLetter+ }
+      Num { std.digit+ }
+      Var { std.asciiLetter+ }
       whitespace { std.whitespace+ }
     }
     @skip { whitespace }`)
@@ -49,8 +48,8 @@ describe("parsing", () => {
   function qq(parser: Parser, ast: Tree) {
     return function(query: string, offset = 1): {start: number, end: number} {
       let result = null
-      ast.iterate(0, ast.length, (tag, start, end) => {
-        if (tag.tag == query && --offset == 0) result = {start, end}
+      ast.iterate(0, ast.length, (type, start, end) => {
+        if (type.name == query && --offset == 0) result = {start, end}
       })
       if (result) return result
       throw new Error("Couldn't find " + query)
@@ -60,8 +59,7 @@ describe("parsing", () => {
   it("can parse incrementally", () => {
     let doc = "if true { print(1); hello; } while false { if 1 do(something 1 2 3); }"
     let ast = p1().parse(doc, {bufferLength: 2})
-    let expected = "cond(var,block(call(var,num),var))," +
-      "loop(var,block(cond(num,call(var,var,num,num,num))))"
+    let expected = "Cond(Var,Block(Call(Var,Num),Var)),Loop(Var,Block(Cond(Num,Call(Var,Var,Num,Num,Num))))"
     testTree(ast, expected)
     ist(ast.length, 70)
     let pos = doc.indexOf("false"), doc2 = doc.slice(0, pos) + "x" + doc.slice(pos + 5)
@@ -76,16 +74,16 @@ describe("parsing", () => {
     let ast = p1().parse(doc, {bufferLength: 10, strict: true})
     let q = qq(p1(), ast)
     ist(ast.length, 39)
-    let cond = q("cond"), one = q("num")
+    let cond = q("Cond"), one = q("Num")
     ist(cond.start, 0); ist(cond.end, 39)
     ist(one.start, 3); ist(one.end, 4)
-    let loop = q("loop"), two = q("num", 2)
+    let loop = q("Loop"), two = q("Num", 2)
     ist(loop.start, 7); ist(loop.end, 37)
     ist(two.start, 13); ist(two.end, 14)
-    let call = q("call"), inner = q("call", 2)
+    let call = q("Call"), inner = q("Call", 2)
     ist(call.start, 17); ist(call.end, 34)
     ist(inner.start, 21); ist(inner.end, 33)
-    let bar = q("var", 2), bug = q("var", 4)
+    let bar = q("Var", 2), bug = q("Var", 4)
     ist(bar.start, 21); ist(bar.end, 24)
     ist(bug.start, 29); ist(bug.end, 32)
   })
@@ -98,27 +96,27 @@ describe("parsing", () => {
 
     let cx111 = ast.resolve(7)
     ist(cx111.depth, 2)
-    ist(cx111.tag.tag, "num")
+    ist(cx111.name, "Num")
     ist(cx111.start, 6)
     ist(cx111.end, 9)
-    ist(cx111.parent!.tag.tag, "loop")
+    ist(cx111.parent!.name, "Loop")
     ist(cx111.parent!.start, 0)
     ist(cx111.parent!.end, 33)
 
     let cxThree = ast.resolve(22)
     ist(cxThree.depth, 4)
-    ist(cxThree.tag.tag, "var")
+    ist(cxThree.name, "Var")
     ist(cxThree.start, 21)
     ist(cxThree.end, 26)
 
     let cxCall = cxThree.parent!
-    ist(cxCall.tag.tag, "call")
+    ist(cxCall.name, "Call")
     ist(cxCall.start, 17)
     ist(cxCall.end, 30)
 
     let branch = cxThree.resolve(18)
     ist(branch.depth, 4)
-    ist(branch.tag.tag, "var")
+    ist(branch.name, "Var")
     ist(branch.start, 17)
     ist(branch.end, 20)
 
@@ -128,10 +126,10 @@ describe("parsing", () => {
 
     ist(cxCall.childBefore(cxCall.start), null)
     ist(cxCall.childAfter(cxCall.end), null)
-    ist(cxCall.childBefore(27)!.tag.tag, "var")
-    ist(cxCall.childAfter(26)!.tag.tag, "num")
-    ist(cxCall.childBefore(28)!.tag.tag, "num")
-    ist(cxCall.childAfter(28)!.tag.tag, "num")
+    ist(cxCall.childBefore(27)!.name, "Var")
+    ist(cxCall.childAfter(26)!.name, "Num")
+    ist(cxCall.childBefore(28)!.name, "Num")
+    ist(cxCall.childAfter(28)!.name, "Num")
   }
 
   it("can resolve positions in buffers", () => testResolve(1024))
@@ -139,21 +137,21 @@ describe("parsing", () => {
   it("can resolve positions in trees", () => testResolve(2))
 
   let iterDoc = "while 1 { a; b; c(d e); } while 2 { f; }"
-  let iterSeq = ["loop", 0, "num", 6, "/num", 7, "block", 8, "var", 10, "/var", 11,
-                 "var", 13, "/var", 14, "call", 16, "var", 16, "/var", 17,
-                 "var", 18, "/var", 19, "var", 20, "/var", 21, "/call", 22,
-                 "/block", 25, "/loop", 25, "loop", 26, "num", 32, "/num", 33, "block", 34, "var", 36,
-                 "/var", 37, "/block", 40, "/loop", 40]
+  let iterSeq = ["Loop", 0, "Num", 6, "/Num", 7, "Block", 8, "Var", 10, "/Var", 11,
+                 "Var", 13, "/Var", 14, "Call", 16, "Var", 16, "/Var", 17,
+                 "Var", 18, "/Var", 19, "Var", 20, "/Var", 21, "/Call", 22,
+                 "/Block", 25, "/Loop", 25, "Loop", 26, "Num", 32, "/Num", 33, "Block", 34, "Var", 36,
+                 "/Var", 37, "/Block", 40, "/Loop", 40]
   // Node boundaries seen when iterating range 13-19 ("b; c(d")
-  let partialSeq = ["loop", 0, "block", 8, "var", 13, "/var", 14, "call", 16, "var", 16,
-                    "/var", 17, "var", 18, "/var", 19, "/call", 22, "/block", 25, "/loop", 25]
+  let partialSeq = ["Loop", 0, "Block", 8, "Var", 13, "/Var", 14, "Call", 16, "Var", 16,
+                    "/Var", 17, "Var", 18, "/Var", 19, "/Call", 22, "/Block", 25, "/Loop", 25]
 
   function testIter(bufferLength: number, partial: boolean) {
     let parser = p1(), output: any[] = []
     let ast = parser.parse(iterDoc, {strict: true, bufferLength})
     ast.iterate(partial ? 13 : 0, partial ? 19 : ast.length,
-                (open, start) => { output.push(open.tag, start) },
-                (close, _, end) => { output.push("/" + close.tag, end) })
+                (open, start) => { output.push(open.name, start) },
+                (close, _, end) => { output.push("/" + close.name, end) })
     ist(output.join(), (partial ? partialSeq : iterSeq).join())
   }
 
@@ -169,8 +167,8 @@ describe("parsing", () => {
     let parser = p1(), output: any[] = []
     let ast = parser.parse(iterDoc, {strict: true, bufferLength})
     ast.iterate(partial ? 19 : ast.length, partial ? 13 : 0,
-                (close, _, end) => { output.push(end, "/" + close.tag) },
-                (open, start) => { output.push(start, open.tag) })
+                (close, _, end) => { output.push(end, "/" + close.name) },
+                (open, start) => { output.push(start, open.name) })
     ist(output.reverse().join(), (partial ? partialSeq : iterSeq).join())
   }
 
@@ -186,30 +184,29 @@ describe("parsing", () => {
     let parser = buildParser(`
 @precedence { times @left, plus @left }
 @top { expr+ }
-expr { binOp | var }
-binOp:bin { expr !plus "+" expr | expr !times "*" expr }
+expr { Bin | Var }
+Bin { expr !plus "+" expr | expr !times "*" expr }
 @skip { space }
-@tokens { space { " "+ } var:var { "x" } }
-@tags { "*":times "+":plus }
+@tokens { space { " "+ } Var { "x" } "*"[name=Times] "+"[name=Plus] }
 `)
     let ast = parser.parse("x + x + x", {strict: true, bufferLength: 2})
-    testTree(ast, "bin(bin(var,plus,var),plus,var)")
+    testTree(ast, "Bin(Bin(Var,Plus,Var),Plus,Var)")
     let ast2 = parser.parse("x * x + x + x", {strict: true, bufferLength: 2, cache: change(ast, [0, 0, 0, 4])})
-    testTree(ast2, "bin(bin(bin(var,times,var),plus,var),plus,var)")
+    testTree(ast2, "Bin(Bin(Bin(Var,Times,Var),Plus,Var),Plus,Var)")
   })
 
   it("can cache skipped content", () => {
     let comments = buildParser(`
 @top { "x"+ }
-@skip { space | comment }
+@skip { space | Comment }
 @skip {} {
-  comment:comment { commentStart (comment | commentContent)* commentEnd }
+  Comment { commentStart (Comment | commentContent)* commentEnd }
 }
 @tokens {
   space { " "+ }
   commentStart { "(" }
   commentEnd { ")" }
-  commentContent { [^()]+ }
+  commentContent { ![()]+ }
 }`)
     let doc = "x  (one (two) (three " + "(y)".repeat(500) + ")) x"
     let ast = comments.parse(doc, {bufferLength: 10, strict: true})
@@ -220,9 +217,9 @@ binOp:bin { expr !plus "+" expr | expr !times "*" expr }
 
 describe("sequences", () => {
   let p1 = p(`
-    @top { (x | y)+ }
-    x:x { "x" }
-    y:y { "y" ";"* }`)
+    @top { (X | Y)+ }
+    X { "x" }
+    Y { "y" ";"* }`)
 
   function depth(tree: any): number {
     return tree instanceof Tree ? tree.children.reduce((d, c) => Math.max(d, depth(c) + 1), 1) : 1
@@ -261,13 +258,13 @@ describe("sequences", () => {
     let parser = p1()
     let ast = parser.parse(doc, {bufferLength: 10})
     let i = 0
-    ast.iterate(0, ast.length, (tag, start, end) => {
+    ast.iterate(0, ast.length, (type, start, end) => {
       if (i == 100) {
-        ist(tag.tag, "y")
+        ist(type.name, "Y")
         ist(start, 100)
         ist(end, 110)
       } else {
-        ist(tag.tag, "x")
+        ist(type.name, "X")
         ist(end, start + 1)
         ist(start, i < 100 ? i : i + 9)
       }
@@ -280,64 +277,61 @@ describe("nesting", () => {
   it("can nest grammars", () => {
     let inner = buildParser(`
 @top { expr+ }
-expr { ("(":p.open expr+ ")":p.close):b | ".":dot }`)
+expr { B { Open{"("} expr+ Close{")"} } | Dot{"."} }`)
     let outer = buildParser(`
-@external-grammar inner from "."
+@external grammar inner from "."
 @top { expr+ }
-expr { "[[" nest.inner<:foo> "]]" | "!":bang }
-@tags { "[[":b.open "]]":b.close }
+expr { "[[" nest.inner "]]" | Bang{"!"} }
+@tokens { "[["[name=Start] "]]"[name=End] }
 `, {nestedGrammar() { return inner }})
 
-    testTree(outer.parse("![[((.).)]][[.]]"),
-             'bang,b.open,foo(b(p.open,b(p.open,dot,p.close),dot,p.close)),b.close,b.open,foo(dot),b.close')
-    testTree(outer.parse("[[/\]]"), 'b.open,foo(⚠),b.close')
+    testTree(outer.parse("![[((.).)]][[.]]"), 'Bang,Start,B(Open,B(Open,Dot,Close),Dot,Close),End,Start,Dot,End')
+    testTree(outer.parse("[[/\]]"), 'Start,⚠,End')
   })
 
   it("supports conditional nesting and end token predicates", () => {
-    let inner = buildParser(`@top { any } @tokens { any { _+ } }`)
     let outer = buildParser(`
-@external-grammar inner from "."
-@top { tag }
-tag:tag { open nest.inner<:text, "</" name ">", tag*> close }
-open:open { "<" name ">" }
-close:close { "</" name ">" }
-@tokens {
-  name { std.asciiLetter+ }
-}
-`, {nestedGrammar() { return nest }})
-
-    function nest(stream: InputStream, stack: Stack) {
-      let tag = /<(\w+)>$/.exec(stream.read(stack.ruleStart, stack.pos))
-      if (!tag || !["textarea", "script", "style"].includes(tag[1])) return {stay: true}
-      return {
-        parser: inner,
-        filterEnd(token: string) { return token == "</" + tag![1] + ">" }
+@external grammar inner from "."
+@top { Tag }
+Tag { Open nest.inner<"</" name ">", Tag*> Close }
+Open { "<" name ">" }
+Close { "</" name ">" }
+@tokens { name { std.asciiLetter+ } }
+@export Text {}`, {
+    nestedGrammar(_, terms) {
+      return function nest(stream: InputStream, stack: Stack) {
+        let tag = /<(\w+)>$/.exec(stream.read(stack.ruleStart, stack.pos))
+        if (!tag || !["textarea", "script", "style"].includes(tag[1])) return {stay: true}
+        return {
+          filterEnd(token: string) { return token == "</" + tag![1] + ">" },
+          wrapType: terms.Text
+        }
       }
-    }
+    }})
 
     testTree(outer.parse("<foo><bar></baz></foo>"),
-             "tag(open,tag(open,close),close)")
+             "Tag(Open,Tag(Open,Close),Close)")
     testTree(outer.parse("<textarea><bar></baz></textarea>"),
-             "tag(open,text,close)")
+             "Tag(Open,Text,Close)")
   })
 
   it("allows updating the nested grammars for a parser", () => {
-    let inner1 = buildParser(`@top { "x":a+ }`)
-    let inner2 = buildParser(`@top { "x":b+ }`)
-    let outer = buildParser(`@external-grammar inner from "." @top { "[" nest.inner<:nest> "]" } @tags { "[":o "]":c }`,
+    let inner1 = buildParser(`@top { A { "x" }+ }`)
+    let inner2 = buildParser(`@top { B { "x" }+ }`)
+    let outer = buildParser(`@external grammar inner from "." @top { "[" nest.inner "]" } @tokens { "["[name=O] "]"[name=C] }`,
                             {nestedGrammar() { return inner1 }})
-    testTree(outer.parse("[x]"), 'o,nest(a),c')
-    testTree(outer.withNested({inner: inner2}).parse("[x]"), 'o,nest(b),c')
+    testTree(outer.parse("[x]"), "O,A,C")
+    testTree(outer.withNested({inner: inner2}).parse("[x]"), "O,B,C")
   })
 
   it("supports tag-less nesting", () => {
-    let inner = buildParser(`@top { "x":x }`)
-    let outer = buildParser(`@external-grammar x from "." @top { "&" nest.x "&" } @tags { "&":and }`, {nestedGrammar() { return inner }})
-    testTree(outer.parse("&x&"), 'and,x,and')
+    let inner = buildParser(`@top { X{"x"} }`)
+    let outer = buildParser(`@external grammar x from "." @top { "&" nest.x "&" } @tokens { "&"[name=And] }`, {nestedGrammar() { return inner }})
+    testTree(outer.parse("&x&"), 'And,X,And')
   })
 
   it("skips ranges with missing nested parsers", () => {
-    let outer = buildParser(`@external-grammar inner @top { "[" nest.inner<:n> "]" } @tags { "[":o "]":c }`)
-    testTree(outer.parse("[lfkdsajfa]"), 'o,n,c')
+    let outer = buildParser(`@external grammar inner empty @top { "[" nest.inner "]" } @tokens { "["[name=O] "]"[name=C] }`)
+    testTree(outer.parse("[lfkdsajfa]"), 'O,C')
   })
 })

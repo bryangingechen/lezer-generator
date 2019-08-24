@@ -124,7 +124,7 @@ export class State {
     let out = "digraph {\n"
     this.reachable(state => {
       if (state.accepting.length)
-        out += `  ${state.id} [label=${state.accepting.join()}];\n`
+        out += `  ${state.id} [label=${JSON.stringify(state.accepting.join())}];\n`
       for (let edge of state.edges)
         out += `  ${state.id} ${edge};\n`
     })
@@ -152,7 +152,8 @@ export class State {
       offsets[state.id] = start
       data.push(state.stateMask(groupMasks), acceptEnd, state.edges.length)
       state.accepting.sort((a, b) => precedence.indexOf(a.id) - precedence.indexOf(b.id))
-      for (let term of state.accepting) data.push(term.id, groupMasks[term.id] || 0xffff)
+      for (let term of state.accepting)
+        data.push(term.id, groupMasks[term.id] || 0xffff)
       for (let edge of state.edges) data.push(edge.from, edge.to, -edge.target.id - 1)
     })
     // Replace negative numbers with resolved state offsets

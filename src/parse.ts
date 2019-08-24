@@ -1,16 +1,15 @@
 import {GrammarDeclaration, RuleDeclaration, PrecDeclaration,
-        TokenPrecDeclaration, TokenDeclaration, ExternalTokenDeclaration,
-        ExternalGrammarDeclaration, Identifier, TagBlock, TagDeclaration,
-        Expression, NamedExpression, ChoiceExpression, SequenceExpression, LiteralExpression,
-        RepeatExpression, SetExpression, TagExpression, TaggedExpression,
-        AtExpression, AnyExpression, ConflictMarker,
-        Tag, TagPart, ValueTag, TagName, TagInterpolation} from "./node"
+        TokenPrecDeclaration, TokenDeclaration, LiteralDeclaration, ExternalTokenDeclaration,
+        ExternalGrammarDeclaration, ExternalPropDeclaration, Identifier,
+        Expression, NameExpression, ChoiceExpression, SequenceExpression, LiteralExpression,
+        RepeatExpression, SetExpression, InlineRuleExpression, Prop, PropPart,
+        SpecializeExpression, AnyExpression, ConflictMarker} from "./node"
 
 // Note that this is the parser for grammar files, not the generated parser
 
-let word = /[\w_\-]+/gy
+let word = /[\w_]+/gy
 // Some engines (specifically SpiderMonkey) have still not implemented \p
-try { word = /[\p{Alphabetic}\d_\-]+/ugy } catch (_) {}
+try { word = /[\p{Alphabetic}\d_]+/ugy } catch (_) {}
 
 const none: readonly any[] = []
 
@@ -68,16 +67,16 @@ export class Input {
       let end = this.match(start + 1, /^(\\.|[^'])*'/)
       if (end == -1) this.raise("Unterminated string literal", start)
       return this.set("string", readString(this.string.slice(start + 1, end - 1)), start, end)
-    } else if (next == "[") {
-      let end = this.match(start + 1, /^(?:\\.|[^\]])*\]/)
-      if (end == -1) this.raise("Unterminated character set", start)
-      return this.set("set", this.string.slice(start + 1, end - 1), start, end)
     } else if (next == "@") {
       word.lastIndex = start + 1
       let m = word.exec(this.string)
       if (!m) return this.raise("@ without a name", start)
       return this.set("at", m[0], start, start + 1 + m[0].length)
-    } else if (/[()!~+*?{}<>\.,|:$=]/.test(next)) {
+    } else if ((next == "$" || next == "!") && this.string[start + 1] == "[") {
+      let end = this.match(start + 2, /^(?:\\.|[^\]])*\]/)
+      if (end == -1) this.raise("Unterminated character set", start)
+      return this.set("set", this.string.slice(start + 2, end - 1), start, end)
+    } else if (/[\[\]()!~+*?{}<>\.,|:$=]/.test(next)) {
       return this.set(next, null, start, start + 1)
     } else {
       word.lastIndex = start
@@ -124,61 +123,93 @@ function parseGrammar(input: Input) {
   let rules: RuleDeclaration[] = []
   let prec: PrecDeclaration | null = null
   let tokens: TokenDeclaration | null = null
-  let tags: TagBlock | null = null
   let mainSkip: Expression | null = null
   let scopedSkip: {expr: Expression, rules: readonly RuleDeclaration[]}[] = []
   let external: ExternalTokenDeclaration[] = []
   let nested: ExternalGrammarDeclaration[] = []
-  let top: Expression | null = null
+  let props: ExternalPropDeclaration[] = []
+  let top: RuleDeclaration | null = null
+  let autoDelim = false
 
   while (input.type != "eof") {
+    let start = input.start
     if (input.type == "at" && input.value == "top") {
       if (top) input.raise(`Multiple @top declarations`, input.start)
       input.next()
-      top = parseBracedExpr(input)
+      top = parseRule(input, new Identifier(start, "@top"))
     } else if (input.type == "at" && input.value == "tokens") {
       if (tokens) input.raise(`Multiple @tokens declaractions`, input.start)
       else tokens = parseTokens(input)
-    } else if (input.type == "at" && input.value == "tags") {
-      if (tags) input.raise(`Multiple @tags declaractions`, input.start)
-      tags = parseTagBlock(input)
-    } else if (input.type == "at" && input.value == "external-tokens") {
-      external.push(parseExternalTokens(input))
-    } else if (input.type == "at" && input.value == "external-grammar") {
-      nested.push(parseExternalGrammar(input))
+    } else if (input.eat("at", "external")) {
+      if (input.eat("id", "tokens")) external.push(parseExternalTokens(input, start))
+      else if (input.eat("id", "grammar")) nested.push(parseExternalGrammar(input, start))
+      else if (input.eat("id", "prop")) nested.push(parseExternalProp(input, start))
+      else input.unexpected()
     } else if (input.type == "at" && input.value == "precedence") {
       if (prec) input.raise(`Multiple precedence declarations`, input.start)
       else prec = parsePrecedence(input)
+    } else if (input.eat("at", "detectDelim")) {
+      autoDelim = true
     } else if (input.eat("at", "skip")) {
       let skip = parseBracedExpr(input)
       if (input.type == "{") {
         input.next()
         let scoped = []
-        while (!input.eat("}")) scoped.push(parseRule(input, false))
+        while (!input.eat("}")) scoped.push(parseRule(input))
         scopedSkip.push({expr: skip, rules: scoped})
       } else {
         if (mainSkip) input.raise(`Multiple top-level skip declarations`, input.start)
         mainSkip = skip
       }
     } else {
-      rules.push(parseRule(input, false))
+      rules.push(parseRule(input))
     }
   }
   if (!top) return input.raise(`Missing @top declaration`)
-  return new GrammarDeclaration(start, rules, top, tokens, tags, external, prec, mainSkip, scopedSkip, nested)
+  return new GrammarDeclaration(start, rules, top, tokens, external, prec, mainSkip, scopedSkip, nested, props, autoDelim)
 }
 
-function parseRule(input: Input, isToken: boolean) {
-  let id = parseIdent(input), params: Identifier[] = []
-  let start = input.start
-
+function parseRule(input: Input, named?: Identifier) {
+  let start = named ? named.start : input.start
+  let exported = input.eat("at", "export")
+  let id = named || parseIdent(input)
+  let props = parseProps(input)
+  let params: Identifier[] = []
   if (input.eat("<")) while (!input.eat(">")) {
     if (params.length) input.expect(",")
     params.push(parseIdent(input))
   }
-  let tag = input.eat(":") ? parseTag(input) : null
   let expr = parseBracedExpr(input)
-  return new RuleDeclaration(start, id, tag, params, expr)
+  return new RuleDeclaration(start, id, exported, props, params, expr)
+}
+
+function parseProps(input: Input) {
+  if (input.type != "[") return none
+  let props = []
+  input.expect("[")
+  while (!input.eat("]")) {
+    if (props.length) input.expect(",")
+    props.push(parseProp(input))
+  }
+  return props
+}
+
+function parseProp(input: Input) {
+  let start = input.start, name = input.expect("id"), value = []
+  if (input.eat("=")) for (;;) {
+    if (input.type == "string" || input.type == "id") {
+      value.push(new PropPart(input.start, input.value, null))
+      input.next()
+    } else if (input.eat(".")) {
+      value.push(new PropPart(input.start, ".", null))
+    } else if (input.eat("{")) {
+      value.push(new PropPart(input.start, null, input.expect("id")))
+      input.expect("}")
+    } else {
+      break
+    }
+  }
+  return new Prop(start, name, value)
 }
 
 function parseBracedExpr(input: Input): Expression {
@@ -201,16 +232,10 @@ function parseExprInner(input: Input): Expression {
     input.next()
     if (value.length == 0) return new SequenceExpression(start, none, [none, none])
     return new LiteralExpression(start, value)
-  } else if (input.eat(":")) {
-    return new TagExpression(start, parseTag(input))
   } else if (input.eat("id", "_")) {
     return new AnyExpression(start)
   } else if (input.type == "set") {
-    let content = input.value, invert = false
-    if (/^\^/.test(content)) {
-      invert = true
-      content = content.slice(1)
-    }
+    let content = input.value, invert = input.string[input.start] == "!"
     let unescaped = readString(content.replace(/\\.|-|"/g, (m: string) => {
       return m == "-" ? SET_MARKER : m == '"' ? '\\"' : m
     }))
@@ -229,17 +254,30 @@ function parseExprInner(input: Input): Expression {
     }
     input.next()
     return new SetExpression(start, ranges.sort((a, b) => a[0] - b[0]), invert)
-  } else if (input.type == "at") {
+  } else if (input.type == "at" && (input.value == "specialize" || input.value == "extend")) {
     let {start, value} = input
     input.next()
-    return new AtExpression(start, value, parseArgs(input))
+    let props = parseProps(input)
+    input.expect("<")
+    let token = parseExprChoice(input)
+    input.expect(",")
+    let content = parseExprChoice(input)
+    input.expect(">")
+    return new SpecializeExpression(start, value, props, token, content)
   } else {
-    let id = parseIdent(input), namespace = null
-    if (input.eat(".")) {
-      namespace = id
-      id = parseIdent(input)
+    let id = parseIdent(input)
+    if (input.type == "[" || input.type == "{") {
+      let rule = parseRule(input, id)
+      if (rule.params.length) input.raise(`Inline rules can't have parameters`, rule.start)
+      return new InlineRuleExpression(start, rule)
+    } else {
+      let namespace = null
+      if (input.eat(".")) {
+        namespace = id
+        id = parseIdent(input)
+      }
+      return new NameExpression(start, namespace, id, parseArgs(input))
     }
-    return new NamedExpression(start, namespace, id, parseArgs(input))
   }
 }
 
@@ -265,8 +303,6 @@ function parseExprSuffix(input: Input): Expression {
     let kind = input.type
     if (input.eat("*") || input.eat("?") || input.eat("+"))
       expr = new RepeatExpression(start, expr, kind as "*" | "+" | "?")
-    else if (input.eat(":"))
-      expr = new TaggedExpression(start, expr, parseTag(input))
     else
       return expr
   }
@@ -313,31 +349,6 @@ function parseIdent(input: Input) {
   return new Identifier(start, name)
 }
 
-function parseTag(input: Input) {
-  let parts = [], start = input.start
-  for (;;) {
-    let part = parseTagPart(input)
-    if (input.eat("="))
-      part = new ValueTag(part.start, part, parseTagPart(input))
-    parts.push(part)
-    if (!input.eat(".")) break
-  }
-  return new Tag(start, parts)
-}
-
-function parseTagPart(input: Input): TagPart {
-  if (input.type == "$") {
-    input.next()
-    return new TagInterpolation(input.start, parseIdent(input))
-  } else if (input.type == "id") {
-    return new TagName(input.start, input.expect("id"))
-  } else if (input.type == "string" && input.value.length) {
-    return new TagName(input.start, input.expect("string"))
-  } else {
-    return input.unexpected()
-  }
-}
-
 function parsePrecedence(input: Input) {
   let start = input.start
   input.next()
@@ -353,49 +364,34 @@ function parsePrecedence(input: Input) {
   return new PrecDeclaration(start, items)
 }
 
-function parseTagBlock(input: Input) {
-  let start = input.start
-  let tags: TagDeclaration[] = []
-  let exprs: AtExpression[] = []
-  input.next()
-  input.expect("{")
-  while (!input.eat("}")) {
-    if (input.type == "at") {
-      exprs.push(parseExprInner(input) as AtExpression)
-    } else {
-      let start = input.start
-      let target = input.type == "string" ? parseExprInner(input) as LiteralExpression : parseIdent(input)
-      input.expect(":")
-      tags.push(new TagDeclaration(start, target, parseTag(input)))
-    }
-  }
-  return new TagBlock(start, tags, exprs)
-}
-      
 function parseTokens(input: Input) {
   let start = input.start
   input.next()
   input.expect("{")
   let tokenRules: RuleDeclaration[] = []
+  let literals: LiteralDeclaration[] = []
   let precedences: TokenPrecDeclaration[] = []
   while (!input.eat("}")) {
-    if (input.type == "at" && input.value == "precedence")
+    if (input.type == "at" && input.value == "precedence") {
       precedences.push(parseTokenPrecedence(input))
-    else
-      tokenRules.push(parseRule(input, true))
+    } else if (input.type == "string") {
+      literals.push(new LiteralDeclaration(input.start, input.expect("string"), parseProps(input)))
+    } else {
+      tokenRules.push(parseRule(input))
+    }
   }
-  return new TokenDeclaration(start, precedences, tokenRules)
+  return new TokenDeclaration(start, precedences, tokenRules, literals)
 }
 
 function parseTokenPrecedence(input: Input) {
   let start = input.start
   input.next()
   input.expect("{")
-  let tokens: (LiteralExpression | NamedExpression)[] = []
+  let tokens: (LiteralExpression | NameExpression)[] = []
   while (!input.eat("}")) {
     if (tokens.length) input.expect(",")
     let expr = parseExprInner(input)
-    if (expr instanceof LiteralExpression || expr instanceof NamedExpression)
+    if (expr instanceof LiteralExpression || expr instanceof NameExpression)
       tokens.push(expr)
     else
       input.raise(`Invalid expression in token precedences`, expr.start)
@@ -403,43 +399,46 @@ function parseTokenPrecedence(input: Input) {
   return new TokenPrecDeclaration(start, tokens)
 }
 
-function parseExternalTokens(input: Input) {
-  let {start} = input
-  input.next()
+function parseExternalTokens(input: Input, start: number) {
   let id = parseIdent(input)
   input.expect("id", "from")
   let from = input.value
   input.expect("string")
-  let tokens: {id: Identifier, tag: Tag | null}[] = []
+  let tokens: {id: Identifier, props: readonly Prop[]}[] = []
   input.expect("{")
   while (!input.eat("}")) {
     if (tokens.length) input.expect(",")
     let id = parseIdent(input)
-    let tag = input.eat(":") ? parseTag(input) : null
-    tokens.push({id, tag})
+    let props = parseProps(input)
+    tokens.push({id, props})
   }
   return new ExternalTokenDeclaration(start, id, from, tokens)
 }
 
-function parseExternalGrammar(input: Input) {
-  let {start} = input
-  input.next()
+function parseExternalGrammar(input: Input, start: number) {
   let externalID = parseIdent(input)
-  // FIXME this is ambigous with a rule names as or from coming after
-  // a null import
   let id = input.eat("id", "as") ? parseIdent(input) : externalID
-  let from = input.eat("id", "from") ? input.value : null
-  if (from) input.expect("string")
+  let from = null
+  if (input.eat("id", "from")) from = input.expect("string")
+  else input.expect("id", "empty")
   return new ExternalGrammarDeclaration(start, id, externalID, from)
 }
 
+function parseExternalProp(input: Input, start: number) {
+  let externalID = parseIdent(input)
+  let id = input.eat("id", "as") ? parseIdent(input) : externalID
+  input.expect("id", "from")
+  let from = input.expect("string")
+  return new ExternalPropDeclaration(start, id, externalID, from)
+}
+
 function readString(string: string) {
-  let point = /\\(?:u\{([\da-f]+)\}|u([\da-f]{4})|x([\da-f]{2})|([ntb0])|(.))|./yig
+  let point = /\\(?:u\{([\da-f]+)\}|u([\da-f]{4})|x([\da-f]{2})|([ntbr0])|(.))|./yig
   let out = "", m
   while (m = point.exec(string)) {
     let [all, u1, u2, u3, single, unknown] = m
     if (u1 || u2 || u3) out += String.fromCodePoint(parseInt(u1 || u2 || u3, 16))
-    else if (single) out += single == "n" ? "\n" : single == "t" ? "\t" : single == "0" ? "\0" : "\b"
+    else if (single) out += single == "n" ? "\n" : single == "t" ? "\t" : single == "0" ? "\0" : single == "r" ? "\r" : "\b"
     else if (unknown) out += unknown
     else out += all
   }
