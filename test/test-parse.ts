@@ -48,9 +48,9 @@ describe("parsing", () => {
   function qq(parser: Parser, ast: Tree) {
     return function(query: string, offset = 1): {start: number, end: number} {
       let result = null
-      ast.iterate(0, ast.length, (type, start, end) => {
+      ast.iterate({enter(type, start, end) {
         if (type.name == query && --offset == 0) result = {start, end}
-      })
+      }})
       if (result) return result
       throw new Error("Couldn't find " + query)
     }
@@ -91,8 +91,7 @@ describe("parsing", () => {
   let resolveDoc = "while 111 { one; two(three 20); }"
 
   function testResolve(bufferLength: number) {
-    let parser = p1()
-    let ast = parser.parse(resolveDoc, {strict: true, bufferLength})
+    let ast = p1().parse(resolveDoc, {strict: true, bufferLength})
 
     let cx111 = ast.resolve(7)
     ist(cx111.depth, 2)
@@ -136,6 +135,13 @@ describe("parsing", () => {
 
   it("can resolve positions in trees", () => testResolve(2))
 
+  it("caches resolved trees", () => {
+    let tree = p1().parse(resolveDoc, {strict: true, bufferLength: 2})
+    let one = tree.resolve(13)
+    ist(tree.resolve(13), one)
+    ist(tree.resolve(11), one.parent)
+  })
+
   let iterDoc = "while 1 { a; b; c(d e); } while 2 { f; }"
   let iterSeq = ["Loop", 0, "Num", 6, "/Num", 7, "Block", 8, "Var", 10, "/Var", 11,
                  "Var", 13, "/Var", 14, "Call", 16, "Var", 16, "/Var", 17,
@@ -149,9 +155,12 @@ describe("parsing", () => {
   function testIter(bufferLength: number, partial: boolean) {
     let parser = p1(), output: any[] = []
     let ast = parser.parse(iterDoc, {strict: true, bufferLength})
-    ast.iterate(partial ? 13 : 0, partial ? 19 : ast.length,
-                (open, start) => { output.push(open.name, start) },
-                (close, _, end) => { output.push("/" + close.name, end) })
+    ast.iterate({
+      from: partial ? 13 : 0,
+      to: partial ? 19 : ast.length,
+      enter(open, start) { output.push(open.name, start) },
+      leave(close, _, end) { output.push("/" + close.name, end) }
+    })
     ist(output.join(), (partial ? partialSeq : iterSeq).join())
   }
 
@@ -166,9 +175,12 @@ describe("parsing", () => {
   function testIterRev(bufferLength: number, partial: boolean) {
     let parser = p1(), output: any[] = []
     let ast = parser.parse(iterDoc, {strict: true, bufferLength})
-    ast.iterate(partial ? 19 : ast.length, partial ? 13 : 0,
-                (close, _, end) => { output.push(end, "/" + close.name) },
-                (open, start) => { output.push(start, open.name) })
+    ast.iterate({
+      from: partial ? 19 : ast.length,
+      to: partial ? 13 : 0,
+      enter(close, _, end) { output.push(end, "/" + close.name) },
+      leave(open, start) { output.push(start, open.name) }
+    })
     ist(output.reverse().join(), (partial ? partialSeq : iterSeq).join())
   }
 
@@ -212,6 +224,17 @@ Bin { expr !plus "+" expr | expr !times "*" expr }
     let ast = comments.parse(doc, {bufferLength: 10, strict: true})
     let ast2 = comments.parse(doc.slice(1), {cache: change(ast, [0, 1, 0, 0]), bufferLength: 10})
     ist(shared(ast, ast2), 80, ">")
+  })
+
+  it("doesn't get slow on long invalid input", () => {
+    let t0 = Date.now()
+    let ast = p1().parse("#".repeat(2000))
+    // Testing for timing is always dodgy, but I'm trying to ensure
+    // there's no exponential complexity here. This runs (cold) in
+    // ~60ms on my machine. In case of exponentiality it should become
+    // _extremely_ slow.
+    ist(Date.now() - t0 < 500)
+    ist(ast.toString(), "⚠")
   })
 })
 
@@ -258,7 +281,7 @@ describe("sequences", () => {
     let parser = p1()
     let ast = parser.parse(doc, {bufferLength: 10})
     let i = 0
-    ast.iterate(0, ast.length, (type, start, end) => {
+    ast.iterate({enter(type, start, end) {
       if (i == 100) {
         ist(type.name, "Y")
         ist(start, 100)
@@ -269,7 +292,7 @@ describe("sequences", () => {
         ist(start, i < 100 ? i : i + 9)
       }
       i++
-    })
+    }})
   })
 })
 
